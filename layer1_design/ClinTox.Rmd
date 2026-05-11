@@ -1,0 +1,192 @@
+---
+title: "ClinTox Dataset"
+author: "2482057 이희진"
+date: '`r Sys.Date()`'
+output: word_document
+---
+
+# 패키지 설치 및 라이브러리 불러오기
+```{r}
+install.packages(c(
+  "data.table",
+  "caret",
+  "xgboost",
+  "Matrix",
+  "pROC",
+  "dplyr"
+))
+
+install.packages("rcdk", repos="https://cloud.r-project.org")
+install.packages("fingerprint")
+
+library(data.table)
+library(caret)
+library(xgboost)
+library(Matrix)
+library(pROC)
+library(dplyr)
+library(rcdk)
+library(fingerprint)
+```
+
+```{r}
+setwd("C:/Users/kulee/Downloads")
+clintox <- fread("clintox.csv.gz")
+
+head(clintox)
+```
+
+
+#Morgan Fingerprint 생성
+```{r}
+# SMILES → 분자 객체 변환
+molecules <- parse.smiles(clintox$smiles)
+
+# NULL 제거
+valid_idx <- !sapply(molecules, is.null)
+
+molecules_valid <- molecules[valid_idx]
+
+clintox_valid <- clintox[valid_idx, ]
+
+# fingerprint 생성 함수
+get_fp <- function(mol) {
+  tryCatch({
+    fp <- get.fingerprint(
+      mol,
+      type = "circular",
+      fp.mode = "bit",
+      depth = 2,
+      size = 1024
+    )
+    vec <- rep(0, 1024)  # binary vector 변환
+    vec[fp@bits] <- 1
+    
+    return(vec)
+    
+  }, error = function(e) {
+    return(rep(0, 1024))
+  })
+}
+
+
+# Fingerprint Matrix 생성
+fp_matrix <- t(sapply(molecules, get_fp))
+
+dim(fp_matrix)
+
+# Label 생성
+label <- clintox$CT_TOX
+
+# Train set vs. Test set (학습 데이터와 평가 데이터 구분)
+set.seed(42)
+
+train_idx <- createDataPartition(label, p = 0.8, list = FALSE)
+
+X_train <- fp_matrix[train_idx, ]
+X_test  <- fp_matrix[-train_idx, ]
+
+y_train <- label[train_idx]
+y_test  <- label[-train_idx]
+```
+
+
+# XGBoost용 데이터 변환
+```{r}
+dtrain <- xgb.DMatrix(data = X_train, label = y_train)
+dtest  <- xgb.DMatrix(data = X_test, label = y_test)
+```
+
+
+# XGBoost Classifier 학습 - "분자 fingerprint를 이용해 독성 여부를 예측하는 XGBoost AI 모델"을 학습시킴
+```{r}
+
+params <- list(
+  objective = "binary:logistic",
+  eval_metric = "auc", #모델 성능 평가 기준 = auc
+  max_depth = 6, #의사결정나무 최대 깊이(트리 복잡도 결정)
+  eta = 0.1, # learning rate: 모델이 한 번에 얼마나 많이 학습할지 결정
+  subsample = 0.8, # 각 트리가 전체 데이터의 80%만 랜덤 사용
+  colsample_bytree = 0.8 # feature의 80%만 랜덤 사용
+)
+
+xgb_model <- xgb.train(
+  params = params,
+  data = dtrain,
+  nrounds = 100, # 트리를 100번 추가 학습
+  evals = list(
+    train = dtrain,
+    test = dtest # 학습 중 성능 모니터링
+  ),
+  verbose = 1 # 학습 진행 상황 출력
+)
+```
+
+
+# 독성 확률 P2 예측
+# 0에 가까울수록 안전, 1에 가까울수록 독성 위험 높음
+```{r}
+P2_prob <- predict(xgb_model, dtest)
+
+head(P2_prob)
+```
+
+
+# 모델이 예측한 독성 확률 P2를 실제 클래스(독성/비독성)로 변환 (Threshold = 0.5)
+```{r}
+pred_class <- ifelse(P2_prob > 0.5, 1, 0)
+```
+
+
+# Confusion Matrix: 독성 예측 모델이 실제로 얼마나 잘 작동하는지 평가
+```{r}
+conf_mat <- confusionMatrix(
+  factor(pred_class),
+  factor(y_test), # 실제 정답 데이터
+  positive = "1" # 독성을 positive class로 지정
+)
+
+print(conf_mat)
+```
+
+
+# 모델이 예측한 독성 확률 P2를 실제 클래스(독성/비독성)로 변환 (Threshold = 0.3)
+```{r}
+pred_class <- ifelse(P2_prob > 0.3, 1, 0)
+```
+
+# Confusion Matrix: 독성 예측 모델이 실제로 얼마나 잘 작동하는지 평가
+```{r}
+conf_mat <- confusionMatrix(
+  factor(pred_class),
+  factor(y_test), 
+  positive = "1" 
+)
+
+print(conf_mat)
+```
+
+# FN Rate 계산
+```{r}
+cm <- conf_mat$table
+
+FN <- cm[1,2]
+TP <- cm[2,2]
+
+false_negative_risk <- FN / (FN + TP)
+
+false_negative_risk
+```
+
+# ROC-AUC 평가
+```{r}
+plot(roc_obj, 
+     col = "darkblue", 
+     lwd = 2,
+     main = "ROC Curve with AUC")
+
+text(0.6, 0.2, 
+     labels = paste0("AUC = ", round(auc(roc_obj), 3)),
+     cex = 1.2)
+```
+
