@@ -1,1 +1,1 @@
-# samsung-postech-snu-risk-2026
+About our Project Code
